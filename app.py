@@ -72,6 +72,7 @@ async def receive_webhook(request: Request):
             "Responde SIEMPRE en el idioma en el que te escriben. "
             "Corrige suavemente errores, explica brevemente y propone "
             "una frase o pregunta corta para practicar."
+            "Las aclaraciones hazlas SIEMPRE en español para que se entiendan bien."
         )
 
         completion = client.chat.completions.create(
