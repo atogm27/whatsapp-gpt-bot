@@ -14,6 +14,15 @@ WA_TOKEN = os.environ.get("WA_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
+if not VERIFY_TOKEN:
+    print("⚠️ Falta VERIFY_TOKEN")
+if not WA_PHONE_ID:
+    print("⚠️ Falta WA_PHONE_ID")
+if not WA_TOKEN:
+    print("⚠️ Falta WA_TOKEN")
+if not OPENAI_API_KEY:
+    print("⚠️ Falta OPENAI_API_KEY")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 GRAPH_URL = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
 
@@ -38,6 +47,7 @@ async def verify_webhook(request: Request):
 # 2) FUNCIÓN PARA ENVIAR MENSAJES A WHATSAPP
 # ====================================================
 async def send_text(to: str, body: str):
+    """Envía un mensaje de texto al usuario por WhatsApp Cloud API."""
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -59,7 +69,7 @@ async def send_text(to: str, body: str):
 # ====================================================
 # 3) FUNCIÓN PARA DETECTAR EL IDIOMA DEL MENSAJE
 # ====================================================
-async def detectar_idioma(text: str):
+async def detectar_idioma(text: str) -> str:
     tools = [
         {
             "type": "function",
@@ -77,7 +87,7 @@ async def detectar_idioma(text: str):
                             )
                         }
                     },
-                    "required": ["language"]
+                    "required": ["language"],
                 },
             },
         }
@@ -90,7 +100,8 @@ async def detectar_idioma(text: str):
                 "role": "system",
                 "content": (
                     "Tu única tarea es detectar el idioma del mensaje "
-                    "y devolverlo mediante la función 'clasificar_mensaje'."
+                    "y devolverlo mediante la función 'clasificar_mensaje'. "
+                    "No añadas texto adicional."
                 ),
             },
             {"role": "user", "content": text},
@@ -99,10 +110,9 @@ async def detectar_idioma(text: str):
         tool_choice="auto",
     )
 
-    # === CORREGIDO: ACCESO A LOS ARGUMENTOS DEL TOOL_CALL ===
     tool_calls = res.choices[0].message.tool_calls
     if not tool_calls:
-        print("⚠️ No se devolvieron tool_calls:", res)
+        print("⚠️ No se devolvieron tool_calls al detectar idioma:", res)
         return "desconocido"
 
     tool_call = tool_calls[0]
@@ -111,6 +121,82 @@ async def detectar_idioma(text: str):
 
     language = args.get("language", "desconocido")
     return language
+
+
+# ====================================================
+# 3.b) FUNCIÓN PARA EVALUAR SI HAY ERRORES QUE CORREGIR
+# ====================================================
+async def evaluar_errores(text: str, language: str):
+    """
+    Devuelve:
+      has_errors: bool -> True si merece la pena corregir, False si el texto está bien.
+      severity: str    -> 'ninguno', 'leve', 'moderado', 'alto'
+    """
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "evaluar_errores",
+                "description": (
+                    "Evalúa si el texto del usuario en el idioma indicado contiene "
+                    "errores gramaticales, de vocabulario u ortografía que merezca la pena corregir."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "has_errors": {
+                            "type": "boolean",
+                            "description": (
+                                "true si el texto tiene errores relevantes que conviene corregir; "
+                                "false si el texto es correcto o solo tiene detalles menores."
+                            ),
+                        },
+                        "severity": {
+                            "type": "string",
+                            "description": "Grado aproximado de error en el texto.",
+                            "enum": ["ninguno", "leve", "moderado", "alto"],
+                        },
+                    },
+                    "required": ["has_errors"],
+                },
+            },
+        }
+    ]
+
+    res = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Eres un asistente que evalúa textos. "
+                    "Tu tarea es SOLO decidir si el mensaje del usuario en el idioma indicado "
+                    f"({language}) tiene errores gramaticales, de vocabulario u ortográficos "
+                    "lo suficientemente relevantes como para que un profesor los corrija. "
+                    "No corrijas el texto, no des ejemplos, no des explicaciones. "
+                    "Devuelve únicamente el resultado mediante la función 'evaluar_errores'."
+                ),
+            },
+            {"role": "user", "content": text},
+        ],
+        tools=tools,
+        tool_choice="auto",
+        temperature=0,
+    )
+
+    tool_calls = res.choices[0].message.tool_calls
+    if not tool_calls:
+        print("⚠️ No se devolvieron tool_calls al evaluar errores:", res)
+        return False, "ninguno"
+
+    tool_call = tool_calls[0]
+    args_json = tool_call.function.arguments
+    args = json.loads(args_json)
+
+    has_errors = bool(args.get("has_errors", False))
+    severity = args.get("severity", "ninguno")
+
+    return has_errors, severity
 
 
 # ====================================================
@@ -146,25 +232,47 @@ async def receive_webhook(request: Request):
             return {"status": "no_text"}
 
         # ====================================================
-        # 5) DETECTAR IDIOMA DE FORMA AUTOMÁTICA
+        # 5) DETECTAR IDIOMA
         # ====================================================
         language = await detectar_idioma(text)
         print(f"🌍 Idioma detectado: {language}")
 
         # ====================================================
-        # 6) PROMPT DINÁMICO BASADO EN EL IDIOMA DETECTADO
+        # 5.b) EVALUAR SI HAY ERRORES QUE MEREZCAN CORRECCIÓN
         # ====================================================
-        system_prompt = f"""
+        has_errors, severity = await evaluar_errores(text, language)
+        print(f"🧐 ¿Tiene errores?: {has_errors}, severidad: {severity}")
+
+        # ====================================================
+        # 6) ELEGIR PROMPT EN FUNCIÓN DE SI HAY ERRORES
+        # ====================================================
+        if has_errors:
+            # MODO: responde + corrige
+            system_prompt = f"""
 Eres un tutor experto del idioma {language}.
 Debes responder siempre en {language}.
-Corrige suavemente los errores del usuario.
-Después explica la corrección en español.
-Luego ofrece una frase corta en {language} para practicar.
 
-Formato de respuesta:
-1) Corrección en {language}
-2) Explicación en español
-3) Frase de práctica en {language}
+1) Corrige suavemente el texto del usuario (gramática, vocabulario, estilo).
+2) Explica brevemente en español los errores más importantes y la regla básica.
+3) Ofrece una frase corta en {language} para practicar algo relacionado.
+
+No seas excesivamente extenso. Sé claro, amable y concreto.
+"""
+        else:
+            # MODO: solo responde (sin corregir)
+            system_prompt = f"""
+Eres un tutor experto del idioma {language}.
+El mensaje del usuario se considera gramaticalmente correcto
+o con errores tan leves que no merece la pena corregirlos ahora.
+
+Tu tarea es:
+1) Responder en {language} de forma natural, como en una conversación.
+2) Hacer una pregunta o proponer una frase de práctica en {language}
+   para seguir la conversación.
+3) No reescribas el texto del usuario ni señales errores,
+   salvo que él lo pida explícitamente.
+
+Sé amable, motivador y fomenta que el usuario siga practicando.
 """
 
         # ====================================================
@@ -179,7 +287,8 @@ Formato de respuesta:
             temperature=0.5,
         )
 
-        reply = completion.choices[0].message.content.strip()
+        reply_raw = completion.choices[0].message.content
+        reply = reply_raw.strip() if reply_raw else "Lo siento, hubo un problema generando la respuesta."
 
         # ====================================================
         # 8) RESPONDER AL USUARIO POR WHATSAPP
