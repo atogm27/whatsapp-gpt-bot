@@ -5,41 +5,109 @@ from fastapi.responses import PlainTextResponse
 import httpx
 from openai import OpenAI
 
-# ===== CONSTANTES =====
+# ====================================================
+# 0) CONSTANTES DE PROMPTS
+# ====================================================
 
-prompt_con_error = """
+PROMPT_CON_ERROR = """
 Eres un tutor experto del idioma {language}.
 Debes responder siempre en {language}.
 
 1) Corrige suavemente el texto del usuario (gramática, vocabulario, estilo).
-2) Explica brevemente en español los errores más importantes y la regla básica. Que quede claro el error que hay que corregir.
+2) Explica brevemente en español los errores más importantes y la regla básica. 
+   Que quede claro el error que hay que corregir.
+3) Responde en {language} de forma natural, como en una conversación 
+   para seguir la conversación del alumno.
 
-3) Responder en {language} de forma natural, como en una conversación para seguir la conversación del alumno.
-
-
-No seas excesivamente extenso. Sé amable, motivador y fomenta que el usuario siga practicando.Intenta que la conversación sea agradable y amena. Interesate por cualquier gusto que parezca tener.
+No seas excesivamente extenso. Sé amable, motivador y fomenta que el usuario siga practicando.
+Intenta que la conversación sea agradable y amena. Interésate por cualquier gusto que parezca tener.
 
 Ejemplo:
 
-It's great to hear that you're finding time for personal activities even after a busy day! What kind of stuff are you working on for yourself? Is it a hobby or something else?
+It's great to hear that you're finding time for personal activities even after a busy day! 
+What kind of stuff are you working on for yourself? Is it a hobby or something else?
 
-Frase Corregida: <Not too much here either. I've been working all day, and now I'm doing some stuff for myself.>
+Frase corregida: <Not too much here either. I've been working all day, and now I'm doing some stuff for myself.>
 
-En tu texto, el cambio principal es el uso de contracciones ("I'm" en lugar de "im") y la corrección de la frase para que suene más natural en inglés. También es importante usar "myself" en lugar de "my own" para referirse a hacer cosas para uno mismo. En inglés, es común usar la forma reflexiva "myself" después de verbos como "doing."
+En tu texto, el cambio principal es el uso de contracciones ("I'm" en lugar de "im")
+y la corrección de la frase para que suene más natural en inglés. 
+También es importante usar "myself" en lugar de "my own" para referirse a hacer cosas 
+para uno mismo. En inglés, es común usar la forma reflexiva "myself" después de verbos 
+como "doing".
 """
 
-prompt_sin_error = """
-Eres un habalnte del idioma {language}.
+PROMPT_SIN_ERROR = """
+Eres un hablante del idioma {language}.
 
 Tu tarea es:
-Responder en {language} de forma natural, como en una conversación para seguir la conversación del alumno.
+Responder en {language} de forma natural, como en una conversación 
+para seguir la conversación del alumno.
 
 No reescribas el texto del usuario ni señales errores,
-   salvo que él lo pida explícitamente.
+salvo que él lo pida explícitamente.
 
-Sé amable, motivador y fomenta que el usuario siga practicando.Intenta que la conversación sea agradable y amena. Interesate por cualquier gusto que parezca tener.
-
+Sé amable, motivador y fomenta que el usuario siga practicando.
+Intenta que la conversación sea agradable y amena.
+Interésate por cualquier gusto que parezca tener.
 """
+
+# ====================================================
+# 0.b) CONSTANTES DE TOOLS (FUNCTION CALLING)
+# ====================================================
+
+LANGUAGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "clasificar_mensaje",
+        "description": "Detecta el idioma predominante del mensaje del usuario.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "language": {
+                    "type": "string",
+                    "description": (
+                        "Idioma detectado, por ejemplo: español, inglés, alemán, "
+                        "francés, italiano, japonés, portugués, etc."
+                    ),
+                }
+            },
+            "required": ["language"],
+        },
+    },
+}
+
+ERRORS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "evaluar_errores",
+        "description": (
+            "Evalúa si el texto del usuario en el idioma indicado contiene "
+            "errores gramaticales, de vocabulario u ortografía que merezca la pena corregir."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "has_errors": {
+                    "type": "boolean",
+                    "description": (
+                        "true si el texto tiene errores relevantes que conviene corregir; "
+                        "false si el texto es correcto o solo tiene detalles menores."
+                    ),
+                },
+                "severity": {
+                    "type": "string",
+                    "description": "Grado aproximado de error en el texto.",
+                    "enum": ["ninguno", "leve", "moderado", "alto"],
+                },
+            },
+            "required": ["has_errors"],
+        },
+    },
+}
+
+# ====================================================
+# APP Y CONFIG
+# ====================================================
 
 app = FastAPI()
 
@@ -106,29 +174,6 @@ async def send_text(to: str, body: str):
 # 3) FUNCIÓN PARA DETECTAR EL IDIOMA DEL MENSAJE
 # ====================================================
 async def detectar_idioma(text: str) -> str:
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "clasificar_mensaje",
-                "description": "Detecta el idioma predominante del mensaje del usuario.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "language": {
-                            "type": "string",
-                            "description": (
-                                "Idioma detectado, por ejemplo: español, inglés, alemán, "
-                                "francés, italiano, japonés, portugués, etc."
-                            )
-                        }
-                    },
-                    "required": ["language"],
-                },
-            },
-        }
-    ]
-
     res = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
@@ -142,7 +187,7 @@ async def detectar_idioma(text: str) -> str:
             },
             {"role": "user", "content": text},
         ],
-        tools=tools,
+        tools=[LANGUAGE_TOOL],
         tool_choice="auto",
     )
 
@@ -168,37 +213,6 @@ async def evaluar_errores(text: str, language: str):
       has_errors: bool -> True si merece la pena corregir, False si el texto está bien.
       severity: str    -> 'ninguno', 'leve', 'moderado', 'alto'
     """
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "evaluar_errores",
-                "description": (
-                    "Evalúa si el texto del usuario en el idioma indicado contiene "
-                    "errores gramaticales, de vocabulario u ortografía que merezca la pena corregir."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "has_errors": {
-                            "type": "boolean",
-                            "description": (
-                                "true si el texto tiene errores relevantes que conviene corregir; "
-                                "false si el texto es correcto o solo tiene detalles menores."
-                            ),
-                        },
-                        "severity": {
-                            "type": "string",
-                            "description": "Grado aproximado de error en el texto.",
-                            "enum": ["ninguno", "leve", "moderado", "alto"],
-                        },
-                    },
-                    "required": ["has_errors"],
-                },
-            },
-        }
-    ]
-
     res = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
@@ -215,7 +229,7 @@ async def evaluar_errores(text: str, language: str):
             },
             {"role": "user", "content": text},
         ],
-        tools=tools,
+        tools=[ERRORS_TOOL],
         tool_choice="auto",
         temperature=0,
     )
@@ -283,11 +297,9 @@ async def receive_webhook(request: Request):
         # 6) ELEGIR PROMPT EN FUNCIÓN DE SI HAY ERRORES
         # ====================================================
         if has_errors:
-            # MODO: responde + corrige
-            system_prompt = prompt_con_error.format(language=language)
+            system_prompt = PROMPT_CON_ERROR.format(language=language)
         else:
-            # MODO: solo responde (sin corregir)
-            system_prompt = prompt_sin_error.format(language=language)
+            system_prompt = PROMPT_SIN_ERROR.format(language=language)
 
         # ====================================================
         # 7) LLAMADA PRINCIPAL A OPENAI PARA GENERAR RESPUESTA
