@@ -18,16 +18,25 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 GRAPH_URL = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
 
 
-# ====== WEBHOOK VERIFICATION ======
+# ====================================================
+# 1) VERIFICACIÓN DEL WEBHOOK (GET)
+# ====================================================
 @app.get("/webhook", response_class=PlainTextResponse)
 async def verify_webhook(request: Request):
     params = request.query_params
-    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == VERIFY_TOKEN:
-        return PlainTextResponse(params.get("hub.challenge", ""))
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        return PlainTextResponse(challenge or "")
+
     return PlainTextResponse("error: invalid token", status_code=403)
 
 
-# ====== HELPER: SEND MESSAGE ======
+# ====================================================
+# 2) FUNCIÓN PARA ENVIAR MENSAJES A WHATSAPP
+# ====================================================
 async def send_text(to: str, body: str):
     payload = {
         "messaging_product": "whatsapp",
@@ -35,30 +44,37 @@ async def send_text(to: str, body: str):
         "type": "text",
         "text": {"body": body},
     }
+
     headers = {
         "Authorization": f"Bearer {WA_TOKEN}",
         "Content-Type": "application/json",
     }
+
     async with httpx.AsyncClient(timeout=30) as client_http:
         r = await client_http.post(GRAPH_URL, headers=headers, json=payload)
         print("📤 Respuesta de WhatsApp:", r.status_code, r.text)
         r.raise_for_status()
 
 
-# ====== HELPER: DETECT LANGUAGE ======
+# ====================================================
+# 3) FUNCIÓN PARA DETECTAR EL IDIOMA DEL MENSAJE
+# ====================================================
 async def detectar_idioma(text: str):
     tools = [
         {
             "type": "function",
             "function": {
                 "name": "clasificar_mensaje",
-                "description": "Detecta el idioma predominante del mensaje.",
+                "description": "Detecta el idioma predominante del mensaje del usuario.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "language": {
                             "type": "string",
-                            "description": "Idioma detectado (ej: español, inglés, alemán, francés, italiano, japonés, etc.)"
+                            "description": (
+                                "Idioma detectado, por ejemplo: español, inglés, alemán, "
+                                "francés, italiano, japonés, portugués, etc."
+                            )
                         }
                     },
                     "required": ["language"]
@@ -73,10 +89,9 @@ async def detectar_idioma(text: str):
             {
                 "role": "system",
                 "content": (
-                    "Tu tarea consiste ÚNICAMENTE en detectar el idioma del mensaje "
-                    "del usuario y devolverlo mediante la función 'clasificar_mensaje'. "
-                    "No des texto adicional."
-                )
+                    "Tu única tarea es detectar el idioma del mensaje "
+                    "y devolverlo mediante la función 'clasificar_mensaje'."
+                ),
             },
             {"role": "user", "content": text},
         ],
@@ -84,12 +99,23 @@ async def detectar_idioma(text: str):
         tool_choice="auto",
     )
 
-    tool_call = res.choices[0].message.tool_calls[0]
-    args = json.loads(tool_call["function"]["arguments"])
-    return args["language"]
+    # === CORREGIDO: ACCESO A LOS ARGUMENTOS DEL TOOL_CALL ===
+    tool_calls = res.choices[0].message.tool_calls
+    if not tool_calls:
+        print("⚠️ No se devolvieron tool_calls:", res)
+        return "desconocido"
+
+    tool_call = tool_calls[0]
+    args_json = tool_call.function.arguments
+    args = json.loads(args_json)
+
+    language = args.get("language", "desconocido")
+    return language
 
 
-# ====== MAIN WHATSAPP WEBHOOK (POST) ======
+# ====================================================
+# 4) WEBHOOK PRINCIPAL (POST)
+# ====================================================
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     data = await request.json()
@@ -107,33 +133,43 @@ async def receive_webhook(request: Request):
         msg = messages[0]
         from_id = msg["from"]
 
+        # === obtener el texto ===
         text_obj = msg.get("text")
-        text = text_obj.get("body").strip() if text_obj and text_obj.get("body") else None
+        text = (
+            text_obj.get("body").strip()
+            if text_obj and text_obj.get("body")
+            else None
+        )
 
         if not text:
             await send_text(from_id, "De momento solo puedo procesar mensajes de texto. 😊")
             return {"status": "no_text"}
 
-        # ===== Detectar idioma del usuario =====
+        # ====================================================
+        # 5) DETECTAR IDIOMA DE FORMA AUTOMÁTICA
+        # ====================================================
         language = await detectar_idioma(text)
         print(f"🌍 Idioma detectado: {language}")
 
-        # ===== Crear prompt dinámico =====
+        # ====================================================
+        # 6) PROMPT DINÁMICO BASADO EN EL IDIOMA DETECTADO
+        # ====================================================
         system_prompt = f"""
 Eres un tutor experto del idioma {language}.
-Debes responder SIEMPRE en {language}.
+Debes responder siempre en {language}.
 Corrige suavemente los errores del usuario.
-Luego explica las correcciones brevemente en español.
-Después ofrece una frase corta en {language} para practicar.
-Sé amable, claro y paciente.
+Después explica la corrección en español.
+Luego ofrece una frase corta en {language} para practicar.
 
-Ejemplo de formato:
+Formato de respuesta:
 1) Corrección en {language}
 2) Explicación en español
 3) Frase de práctica en {language}
 """
 
-        # ===== Llamada principal a OpenAI =====
+        # ====================================================
+        # 7) LLAMADA PRINCIPAL A OPENAI PARA GENERAR RESPUESTA
+        # ====================================================
         completion = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
@@ -145,7 +181,9 @@ Ejemplo de formato:
 
         reply = completion.choices[0].message.content.strip()
 
-        # ===== Enviar al usuario =====
+        # ====================================================
+        # 8) RESPONDER AL USUARIO POR WHATSAPP
+        # ====================================================
         await send_text(from_id, reply)
 
         return {"status": "ok"}
