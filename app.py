@@ -326,3 +326,7 @@ async def receive_webhook(request: Request):
     except Exception as e:
         print("❌ Error procesando webhook:", e)
         return {"status": "error", "detail": str(e)}
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
