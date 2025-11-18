@@ -5,6 +5,42 @@ from fastapi.responses import PlainTextResponse
 import httpx
 from openai import OpenAI
 
+# ===== CONSTANTES =====
+
+prompt_con_error = """
+Eres un tutor experto del idioma {language}.
+Debes responder siempre en {language}.
+
+1) Corrige suavemente el texto del usuario (gramática, vocabulario, estilo).
+2) Explica brevemente en español los errores más importantes y la regla básica. Que quede claro el error que hay que corregir.
+
+3) Responder en {language} de forma natural, como en una conversación para seguir la conversación del alumno.
+
+
+No seas excesivamente extenso. Sé amable, motivador y fomenta que el usuario siga practicando.Intenta que la conversación sea agradable y amena. Interesate por cualquier gusto que parezca tener.
+
+Ejemplo:
+
+It's great to hear that you're finding time for personal activities even after a busy day! What kind of stuff are you working on for yourself? Is it a hobby or something else?
+
+Frase Corregida: <Not too much here either. I've been working all day, and now I'm doing some stuff for myself.>
+
+En tu texto, el cambio principal es el uso de contracciones ("I'm" en lugar de "im") y la corrección de la frase para que suene más natural en inglés. También es importante usar "myself" en lugar de "my own" para referirse a hacer cosas para uno mismo. En inglés, es común usar la forma reflexiva "myself" después de verbos como "doing."
+"""
+
+prompt_sin_error = """
+Eres un habalnte del idioma {language}.
+
+Tu tarea es:
+Responder en {language} de forma natural, como en una conversación para seguir la conversación del alumno.
+
+No reescribas el texto del usuario ni señales errores,
+   salvo que él lo pida explícitamente.
+
+Sé amable, motivador y fomenta que el usuario siga practicando.Intenta que la conversación sea agradable y amena. Interesate por cualquier gusto que parezca tener.
+
+"""
+
 app = FastAPI()
 
 # ====== VARIABLES DE ENTORNO ======
@@ -248,31 +284,10 @@ async def receive_webhook(request: Request):
         # ====================================================
         if has_errors:
             # MODO: responde + corrige
-            system_prompt = f"""
-Eres un tutor experto del idioma {language}.
-Debes responder siempre en {language}.
-
-1) Corrige suavemente el texto del usuario (gramática, vocabulario, estilo).
-2) Explica brevemente en español los errores más importantes y la regla básica. Que quede claro el error que hay que corregir.
-
-3) Responder en {language} de forma natural, como en una conversación para seguir la conversación del alumno.
-
-
-No seas excesivamente extenso. Sé amable, motivador y fomenta que el usuario siga practicando.Intenta que la conversación sea agradable y amena. Interesate por cualquier gusto que parezca tener.
-"""
+            system_prompt = prompt_con_error.format(language=language)
         else:
             # MODO: solo responde (sin corregir)
-            system_prompt = f"""
-Eres un habalnte del idioma {language}.
-
-Tu tarea es:
-Responder en {language} de forma natural, como en una conversación para seguir la conversación del alumno.
-
-No reescribas el texto del usuario ni señales errores,
-   salvo que él lo pida explícitamente.
-
-Sé amable, motivador y fomenta que el usuario siga practicando.Intenta que la conversación sea agradable y amena. Interesate por cualquier gusto que parezca tener.
-"""
+            system_prompt = prompt_sin_error.format(language=language)
 
         # ====================================================
         # 7) LLAMADA PRINCIPAL A OPENAI PARA GENERAR RESPUESTA
