@@ -1,3 +1,4 @@
+import io
 import os
 import json
 from typing import cast  # 👈 CAMBIO
@@ -122,6 +123,9 @@ WA_PHONE_ID = os.environ.get("WA_PHONE_ID", "")
 WA_TOKEN = os.environ.get("WA_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TRANSCRIBE_MODEL = os.environ.get(
+    "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"
+)
 
 if not VERIFY_TOKEN:
     print("⚠️ Falta VERIFY_TOKEN")
@@ -173,6 +177,76 @@ async def send_text(to: str, body: str):
         r = await client_http.post(GRAPH_URL, headers=headers, json=payload)
         print("📤 Respuesta de WhatsApp:", r.status_code, r.text)
         r.raise_for_status()
+
+
+# ====================================================
+# 2.b) DESCARGA DE MEDIOS (AUDIOS)
+# ====================================================
+async def download_media(media_id: str):
+    """Descarga el binario del medio y su MIME type a partir de su media_id."""
+
+    headers = {"Authorization": f"Bearer {WA_TOKEN}"}
+    base_url = "https://graph.facebook.com/v20.0"
+
+    async with httpx.AsyncClient(timeout=30) as client_http:
+        meta_resp = await client_http.get(
+            f"{base_url}/{media_id}",
+            headers=headers,
+        )
+        print("ℹ️ Respuesta metadata media:", meta_resp.status_code, meta_resp.text)
+        meta_resp.raise_for_status()
+
+        meta_data = meta_resp.json()
+        media_url = meta_data.get("url")
+        mime_type = meta_data.get("mime_type", "")
+
+        if not media_url:
+            raise ValueError("No se pudo obtener la URL del audio")
+
+        media_resp = await client_http.get(media_url, headers=headers)
+        print("🎧 Descarga de audio:", media_resp.status_code)
+        media_resp.raise_for_status()
+
+        return media_resp.content, mime_type
+
+
+# ====================================================
+# 2.c) TRANSCRIPCIÓN DE AUDIOS
+# ====================================================
+def _extension_from_mime(mime_type: str) -> str:
+    if not mime_type:
+        return "mp3"
+    if "wav" in mime_type:
+        return "wav"
+    if "ogg" in mime_type:
+        return "ogg"
+    if "m4a" in mime_type:
+        return "m4a"
+    return "mp3"
+
+
+async def transcribir_audio(audio_bytes: bytes, mime_type: str | None = None) -> str | None:
+    """Envía el audio al endpoint de OpenAI y devuelve el texto transcrito."""
+
+    ext = _extension_from_mime(mime_type or "")
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = f"audio.{ext}"
+
+    try:
+        transcription = client.audio.transcriptions.create(
+            model=OPENAI_TRANSCRIBE_MODEL,
+            file=audio_file,
+            response_format="text",
+        )
+    except Exception as exc:
+        print("❌ Error transcribiendo audio:", exc)
+        return None
+
+    if isinstance(transcription, str):
+        return transcription.strip()
+
+    text = getattr(transcription, "text", "")
+    return text.strip() if text else None
 
 
 # ====================================================
@@ -275,17 +349,54 @@ async def receive_webhook(request: Request):
         msg = messages[0]
         from_id = msg["from"]
 
-        # === obtener el texto ===
-        text_obj = msg.get("text")
-        text = (
-            text_obj.get("body").strip()
-            if text_obj and text_obj.get("body")
-            else None
-        )
+        # === obtener el texto o transcribir audio ===
+        msg_type = msg.get("type", "text")
+        text = None
+
+        if msg_type == "text":
+            text_obj = msg.get("text")
+            if text_obj and text_obj.get("body"):
+                text = text_obj.get("body").strip()
+        elif msg_type in {"audio", "voice"}:
+            media_obj = msg.get(msg_type) or {}
+            media_id = media_obj.get("id")
+            if not media_id:
+                await send_text(from_id, "No pude obtener el audio, ¿puedes intentarlo otra vez?")
+                return {"status": "no_audio_id"}
+
+            try:
+                audio_bytes, mime_type = await download_media(media_id)
+                transcription = await transcribir_audio(audio_bytes, mime_type)
+            except Exception as exc:
+                print("❌ Error descargando audio:", exc)
+                await send_text(
+                    from_id,
+                    "Hubo un problema descargando tu audio. ¿Puedes enviarlo nuevamente?",
+                )
+                return {"status": "audio_download_error"}
+
+            if transcription:
+                text = transcription
+                print("📝 Transcripción obtenida:", text)
+            else:
+                await send_text(
+                    from_id,
+                    "No pude transcribir tu audio. ¿Podrías intentarlo con otro mensaje?",
+                )
+                return {"status": "transcription_failed"}
+        else:
+            await send_text(
+                from_id,
+                "Por ahora solo puedo ayudarte con mensajes de texto o audios. 😊",
+            )
+            return {"status": "unsupported_type"}
 
         if not text:
-            await send_text(from_id, "De momento solo puedo procesar mensajes de texto. 😊")
-            return {"status": "no_text"}
+            await send_text(
+                from_id,
+                "No recibí contenido para procesar. ¿Podrías enviarlo de nuevo?",
+            )
+            return {"status": "empty_text"}
 
         # ====================================================
         # 5) DETECTAR IDIOMA
