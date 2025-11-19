@@ -1,9 +1,14 @@
 import os
 import json
+from typing import cast  # 👈 CAMBIO
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 import httpx
 from openai import OpenAI
+from openai.types.chat import (         # 👈 CAMBIO
+    ChatCompletionMessageToolCall,
+    ChatCompletionToolParam,
+)
 
 # ====================================================
 # 0) CONSTANTES DE PROMPTS
@@ -55,7 +60,7 @@ Interésate por cualquier gusto que parezca tener.
 # 0.b) CONSTANTES DE TOOLS (FUNCTION CALLING)
 # ====================================================
 
-LANGUAGE_TOOL = {
+LANGUAGE_TOOL: ChatCompletionToolParam = {  # 👈 CAMBIO: tipo explícito
     "type": "function",
     "function": {
         "name": "clasificar_mensaje",
@@ -76,7 +81,7 @@ LANGUAGE_TOOL = {
     },
 }
 
-ERRORS_TOOL = {
+ERRORS_TOOL: ChatCompletionToolParam = {  # 👈 CAMBIO: tipo explícito
     "type": "function",
     "function": {
         "name": "evaluar_errores",
@@ -191,12 +196,13 @@ async def detectar_idioma(text: str) -> str:
         tool_choice="auto",
     )
 
-    tool_calls = res.choices[0].message.tool_calls
+    tool_calls = res.choices[0].message.tool_calls or []  # 👈 CAMBIO: or []
     if not tool_calls:
         print("⚠️ No se devolvieron tool_calls al detectar idioma:", res)
         return "desconocido"
 
-    tool_call = tool_calls[0]
+    # 👇 CAMBIO: casteamos a ChatCompletionMessageToolCall para que el type checker sepa que tiene `.function`
+    tool_call = cast(ChatCompletionMessageToolCall, tool_calls[0])
     args_json = tool_call.function.arguments
     args = json.loads(args_json)
 
@@ -234,12 +240,12 @@ async def evaluar_errores(text: str, language: str):
         temperature=0,
     )
 
-    tool_calls = res.choices[0].message.tool_calls
+    tool_calls = res.choices[0].message.tool_calls or []  # 👈 CAMBIO
     if not tool_calls:
         print("⚠️ No se devolvieron tool_calls al evaluar errores:", res)
         return False, "ninguno"
 
-    tool_call = tool_calls[0]
+    tool_call = cast(ChatCompletionMessageToolCall, tool_calls[0])  # 👈 CAMBIO
     args_json = tool_call.function.arguments
     args = json.loads(args_json)
 
@@ -326,6 +332,7 @@ async def receive_webhook(request: Request):
     except Exception as e:
         print("❌ Error procesando webhook:", e)
         return {"status": "error", "detail": str(e)}
+
 
 @app.get("/")
 async def root():
