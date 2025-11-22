@@ -25,6 +25,39 @@ y la corrección de la frase para que suene más natural en inglés.
 También es importante usar "myself" en lugar de "my own" para referirse a hacer cosas
 para uno mismo. En inglés, es común usar la forma reflexiva "myself" después de verbos
 como "doing".
+
+Ejemplpo 2 
+
+Es freut mich zu hören, dass du dir nach einem langen Arbeitstag trotzdem etwas Zeit für dich nimmst!
+Woran arbeitest du denn gerade? Ist es ein Hobby oder etwas anderes?
+
+Frase corregida:
+<Nicht viel hier auch. Ich habe den ganzen Tag gearbeitet, und jetzt mache ich ein paar Sachen für mich selbst.>
+
+Explicación:
+
+Se usa „ein paar Sachen“ para sonar más natural que einige Sachen.
+
+Se añade „für mich selbst“ para indicar acciones que haces para tu propio beneficio.
+
+Se mantiene el uso de la coma antes de “und” cuando une dos oraciones completas en alemán.
+
+
+Ejemplo 3:
+
+C’est super que tu arrives à prendre un peu de temps pour toi après une longue journée !
+Tu travailles sur quoi en ce moment ? Un loisir ou autre chose ?
+
+Frase corregida:
+<Pas grand-chose ici non plus. J’ai travaillé toute la journée, et maintenant je fais des trucs pour moi-même.>
+
+Explicación:
+
+Se puede usar « trucs » para un tono más natural y cotidiano que des choses.
+
+« pour moi-même » expresa que la actividad es para beneficio personal.
+
+La coma antes de “et” es opcional en francés, pero natural cuando separa dos ideas completas.
 """
 
 PROMPT_SIN_ERROR = """
