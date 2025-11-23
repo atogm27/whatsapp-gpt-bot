@@ -6,13 +6,13 @@ from typing import cast
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 import httpx
-from openai import OpenAI
+from openai import AsyncOpenAI
 from openai.types.chat import (
     ChatCompletionMessageToolCall,
     ChatCompletionToolParam,
 )
 
-from funciones_openai import asistente_cheff  # <- usamos tu bot chef
+from funciones_openai import asistente_cheff  # versión moderna async (Responses API)
 
 # ====================================================
 # 0) CONSTANTES DE PROMPTS (BOT DE IDIOMAS)
@@ -22,33 +22,22 @@ PROMPT_CON_ERROR = """
 Eres un tutor experto del idioma {language}.
 Debes responder siempre en {language}.
 
-1) Corrige suavemente el texto del usuario (gramática, vocabulario, estilo).
-2) Explica brevemente en español los errores más importantes y la regla básica. 
-   Que quede claro el error que hay que corregir.
-3) Responde en {language} de forma natural, como en una conversación 
-   para seguir la conversación del alumno.
+1) Corrige suavemente el texto (gramática, vocabulario, estilo).
+2) Explica en español los errores más importantes y la regla básica.
+3) Responde en {language} para continuar la conversación.
 
-No seas excesivamente extenso. Sé amable, motivador y fomenta que el usuario siga practicando.
-Intenta que la conversación sea agradable y amena. Interésate por cualquier gusto que parezca tener.
+Sé amable, motivador y breve.
 """
 
 PROMPT_SIN_ERROR = """
 Eres un hablante del idioma {language}.
-
-Tu tarea es:
-Responder en {language} de forma natural, como en una conversación 
-para seguir la conversación del alumno.
-
-No reescribas el texto del usuario ni señales errores,
-salvo que él lo pida explícitamente.
-
-Sé amable, motivador y fomenta que el usuario siga practicando.
-Intenta que la conversación sea agradable y amena.
-Intéresate por cualquier gusto que parezca tener.
+Responde de forma natural en {language}, como en una conversación.
+No señales errores a menos que el usuario lo pida.
+Sé amable y fomenta que el usuario siga practicando.
 """
 
 # ====================================================
-# 0.b) CONSTANTES DE TOOLS (FUNCTION CALLING)
+# 0.b) DEFINICIÓN DE TOOLS PARA CHAT COMPLETIONS
 # ====================================================
 
 LANGUAGE_TOOL: ChatCompletionToolParam = {
@@ -102,17 +91,16 @@ ERRORS_TOOL: ChatCompletionToolParam = {
 }
 
 # ====================================================
-# MODOS DE BOT Y SESIONES
+# MODOS Y SESIONES
 # ====================================================
 
 MODO_IDIOMAS = "idiomas"
 MODO_CHEF = "chef"
 
-# user_id (número de WhatsApp) -> modo actual
 user_sessions: dict[str, str] = {}
 
 # ====================================================
-# APP Y CONFIG
+# APP + CONFIG
 # ====================================================
 
 app = FastAPI()
@@ -121,10 +109,9 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 WA_PHONE_ID = os.environ.get("WA_PHONE_ID", "")
 WA_TOKEN = os.environ.get("WA_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TRANSCRIBE_MODEL = os.environ.get(
-    "OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"
-)
+
+OPENAI_MODEL_TEXT = os.environ.get("OPENAI_MODEL_TEXT", "gpt-4o-mini")
+OPENAI_MODEL_TRANSCRIBE = os.environ.get("OPENAI_MODEL_TRANSCRIBE", "gpt-4o-mini-transcribe")
 
 if not VERIFY_TOKEN:
     print("⚠️ Falta VERIFY_TOKEN")
@@ -135,31 +122,25 @@ if not WA_TOKEN:
 if not OPENAI_API_KEY:
     print("⚠️ Falta OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 GRAPH_URL = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
 
 # ====================================================
-# 1) VERIFICACIÓN DEL WEBHOOK (GET)
+# 1) VERIFY WEBHOOK
 # ====================================================
 
 @app.get("/webhook", response_class=PlainTextResponse)
 async def verify_webhook(request: Request):
     params = request.query_params
-    mode = params.get("hub.mode")
-    token = params.get("hub.verify_token")
-    challenge = params.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return PlainTextResponse(challenge or "")
-
+    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == VERIFY_TOKEN:
+        return PlainTextResponse(params.get("hub.challenge", ""))
     return PlainTextResponse("error: invalid token", status_code=403)
 
 # ====================================================
-# 2) ENVIAR MENSAJES A WHATSAPP
+# 2) SEND TEXT
 # ====================================================
 
 async def send_text(to: str, body: str):
-    """Envía un mensaje de texto al usuario por WhatsApp Cloud API."""
     payload = {
         "messaging_product": "whatsapp",
         "to": to,
@@ -172,91 +153,72 @@ async def send_text(to: str, body: str):
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=30) as client_http:
-        r = await client_http.post(GRAPH_URL, headers=headers, json=payload)
-        print("📤 Respuesta de WhatsApp:", r.status_code, r.text)
-        r.raise_for_status()
+    async with httpx.AsyncClient(timeout=30) as httpc:
+        r = await httpc.post(GRAPH_URL, json=payload, headers=headers)
+        print("📤 WA Res:", r.status_code, r.text)
 
 # ====================================================
-# 2.b) DESCARGA DE MEDIOS (AUDIOS)
+# 2.b) DOWNLOAD MEDIA
 # ====================================================
 
 async def download_media(media_id: str):
-    """Descarga el binario del medio y su MIME type a partir de su media_id."""
     headers = {"Authorization": f"Bearer {WA_TOKEN}"}
-    base_url = "https://graph.facebook.com/v20.0"
+    base = "https://graph.facebook.com/v20.0"
 
-    async with httpx.AsyncClient(timeout=30) as client_http:
-        meta_resp = await client_http.get(
-            f"{base_url}/{media_id}",
-            headers=headers,
-        )
-        print("ℹ️ Respuesta metadata media:", meta_resp.status_code, meta_resp.text)
-        meta_resp.raise_for_status()
+    async with httpx.AsyncClient(timeout=30) as httpc:
+        meta = await httpc.get(f"{base}/{media_id}", headers=headers)
+        meta.raise_for_status()
+        info = meta.json()
 
-        meta_data = meta_resp.json()
-        media_url = meta_data.get("url")
-        mime_type = meta_data.get("mime_type", "")
+        url = info["url"]
+        mime = info.get("mime_type", "")
 
-        if not media_url:
-            raise ValueError("No se pudo obtener la URL del audio")
+        audio_res = await httpc.get(url, headers=headers)
+        audio_res.raise_for_status()
 
-        media_resp = await client_http.get(media_url, headers=headers)
-        print("🎧 Descarga de audio:", media_resp.status_code)
-        media_resp.raise_for_status()
-
-        return media_resp.content, mime_type
+        return audio_res.content, mime
 
 # ====================================================
-# 2.c) TRANSCRIPCIÓN DE AUDIOS
+# 2.c) TRANSCRIBE
 # ====================================================
 
-def _extension_from_mime(mime_type: str) -> str:
-    if not mime_type:
-        return "mp3"
-    if "wav" in mime_type:
+def _ext_from_mime(mime: str):
+    if "wav" in mime:
         return "wav"
-    if "ogg" in mime_type:
+    if "ogg" in mime:
         return "ogg"
-    if "m4a" in mime_type:
+    if "m4a" in mime:
         return "m4a"
     return "mp3"
 
-
-async def transcribir_audio(audio_bytes: bytes, mime_type: str | None = None) -> str | None:
-    """Envía el audio al endpoint de OpenAI y devuelve el texto transcrito."""
-    ext = _extension_from_mime(mime_type or "")
-    audio_file = io.BytesIO(audio_bytes)
-    audio_file.name = f"audio.{ext}"
+async def transcribir_audio(audio_bytes: bytes, mime_type: str | None):
+    ext = _ext_from_mime(mime_type or "")
+    f = io.BytesIO(audio_bytes)
+    f.name = f"audio.{ext}"
 
     try:
-        transcription = client.audio.transcriptions.create(
-            model=OPENAI_TRANSCRIBE_MODEL,
-            file=audio_file,
-            response_format="text",
+        res = await client.audio.transcriptions.create(
+            model=OPENAI_MODEL_TRANSCRIBE,
+            file=f,
+            response_format="text"
         )
-    except Exception as exc:
-        print("❌ Error transcribiendo audio:", exc)
+        return res.strip()
+    except Exception as e:
+        print("❌ Error transcribiendo:", e)
         return None
 
-    if isinstance(transcription, str):
-        return transcription.strip()
-
-    text = getattr(transcription, "text", "")
-    return text.strip() if text else None
-
 # ====================================================
-# 3) DETECTAR IDIOMA (TOOL CALLING)
+# X) DETECTAR IDIOMA – usando Chat Completions + tools
 # ====================================================
 
 async def detectar_idioma(text: str) -> str:
-    res = client.chat.completions.create(
-        model=OPENAI_MODEL,
+    res = await client.chat.completions.create(
+        model=OPENAI_MODEL_TEXT,
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Tu única tarea es detectar el idioma del mensaje "
+                    "Tu única tarea es detectar el idioma del texto del usuario "
                     "y devolverlo mediante la función 'clasificar_mensaje'. "
                     "No añadas texto adicional."
                 ),
@@ -267,7 +229,8 @@ async def detectar_idioma(text: str) -> str:
         tool_choice="auto",
     )
 
-    tool_calls = res.choices[0].message.tool_calls or []
+    msg = res.choices[0].message
+    tool_calls = msg.tool_calls or []
     if not tool_calls:
         print("⚠️ No se devolvieron tool_calls al detectar idioma:", res)
         return "desconocido"
@@ -280,7 +243,7 @@ async def detectar_idioma(text: str) -> str:
     return language
 
 # ====================================================
-# 3.b) EVALUAR SI HAY ERRORES (TOOL CALLING)
+# X.b) DETECTAR ERRORES – usando Chat Completions + tools
 # ====================================================
 
 async def evaluar_errores(text: str, language: str):
@@ -289,8 +252,8 @@ async def evaluar_errores(text: str, language: str):
       has_errors: bool -> True si merece la pena corregir, False si el texto está bien.
       severity: str    -> 'ninguno', 'leve', 'moderado', 'alto'
     """
-    res = client.chat.completions.create(
-        model=OPENAI_MODEL,
+    res = await client.chat.completions.create(
+        model=OPENAI_MODEL_TEXT,
         messages=[
             {
                 "role": "system",
@@ -310,7 +273,8 @@ async def evaluar_errores(text: str, language: str):
         temperature=0,
     )
 
-    tool_calls = res.choices[0].message.tool_calls or []
+    msg = res.choices[0].message
+    tool_calls = msg.tool_calls or []
     if not tool_calls:
         print("⚠️ No se devolvieron tool_calls al evaluar errores:", res)
         return False, "ninguno"
@@ -325,27 +289,22 @@ async def evaluar_errores(text: str, language: str):
     return has_errors, severity
 
 # ====================================================
-# X) BOT DE IDIOMAS: GENERAR RESPUESTA
+# BOT IDIOMAS – usando Chat Completions
 # ====================================================
 
-async def generar_respuesta_idiomas(text: str) -> str:
-    # 1) Detectar idioma
+async def generar_respuesta_idiomas(text: str):
     language = await detectar_idioma(text)
     print(f"🌍 Idioma detectado: {language}")
 
-    # 2) Evaluar errores
     has_errors, severity = await evaluar_errores(text, language)
     print(f"🧐 ¿Tiene errores?: {has_errors}, severidad: {severity}")
 
-    # 3) Elegir prompt
-    if has_errors:
-        system_prompt = PROMPT_CON_ERROR.format(language=language)
-    else:
-        system_prompt = PROMPT_SIN_ERROR.format(language=language)
+    system_prompt = (
+        PROMPT_CON_ERROR if has_errors else PROMPT_SIN_ERROR
+    ).format(language=language)
 
-    # 4) Llamar a OpenAI
-    completion = client.chat.completions.create(
-        model=OPENAI_MODEL,
+    completion = await client.chat.completions.create(
+        model=OPENAI_MODEL_TEXT,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
@@ -358,132 +317,98 @@ async def generar_respuesta_idiomas(text: str) -> str:
     return reply
 
 # ====================================================
-# X.b) MANEJO DE COMANDOS (/menu, /idiomas, /chef)
+# COMANDOS
 # ====================================================
 
-def handle_command(from_id: str, text: str) -> str:
-    """
-    Devuelve el texto de respuesta al comando
-    y actualiza user_sessions[from_id] si hace falta.
-    """
-    cmd = text.strip().lower()
+def handle_command(uid: str, text: str):
+    t = text.strip().lower()
 
-    if cmd in ("/menu", "menu"):
+    if t in ("/menu", "menu"):
         return (
             "🧠 *Menú de asistentes*\n"
-            "- /idiomas → Bot de idiomas (corrección + conversación)\n"
-            "- /chef → Asistente chef 🍳\n"
+            "- /idiomas → Bot de idiomas\n"
+            "- /chef → Asistente chef 🍳"
         )
 
-    if cmd == "/idiomas":
-        user_sessions[from_id] = MODO_IDIOMAS
-        return "Has cambiado al modo 🧠 *Bot de idiomas*."
+    if t == "/idiomas":
+        user_sessions[uid] = MODO_IDIOMAS
+        return "Modo cambiado a 🧠 *Idiomas*"
 
-    if cmd == "/chef":
-        user_sessions[from_id] = MODO_CHEF
-        return "Has cambiado al modo 🍳 *Asistente chef*."
+    if t == "/chef":
+        user_sessions[uid] = MODO_CHEF
+        return "Modo cambiado a 🍳 *Chef*"
 
-    return "Comando no reconocido. Escribe /menu para ver las opciones."
+    return "Comando no reconocido. Usa /menu"
 
 # ====================================================
-# 4) WEBHOOK PRINCIPAL (POST)
+# WEBHOOK
 # ====================================================
 
 @app.post("/webhook")
-async def receive_webhook(request: Request):
+async def webhook(request: Request):
     data = await request.json()
-    print("📩 Webhook recibido:", json.dumps(data, indent=2, ensure_ascii=False))
 
     try:
-        entry = data.get("entry", [])[0]
-        changes = entry.get("changes", [])[0]
-        value = changes.get("value", {})
+        entry = data["entry"][0]
+        changes = entry["changes"][0]
+        value = changes["value"]
         messages = value.get("messages", [])
 
         if not messages:
             return {"status": "no_messages"}
 
         msg = messages[0]
-        from_id = msg["from"]
+        uid = msg["from"]
 
-        # === obtener el texto o transcribir audio ===
-        msg_type = msg.get("type", "text")
-        text = None
+        # ========================
+        # TEXTO O AUDIO
+        # ========================
+        msg_type = msg.get("type")
 
         if msg_type == "text":
-            text_obj = msg.get("text")
-            if text_obj and text_obj.get("body"):
-                text = text_obj.get("body").strip()
-        elif msg_type in {"audio", "voice"}:
-            media_obj = msg.get(msg_type) or {}
-            media_id = media_obj.get("id")
-            if not media_id:
-                await send_text(from_id, "No pude obtener el audio, ¿puedes intentarlo otra vez?")
-                return {"status": "no_audio_id"}
+            text = msg["text"]["body"].strip()
 
-            try:
-                audio_bytes, mime_type = await download_media(media_id)
-                transcription = await transcribir_audio(audio_bytes, mime_type)
-            except Exception as exc:
-                print("❌ Error descargando audio:", exc)
-                await send_text(
-                    from_id,
-                    "Hubo un problema descargando tu audio. ¿Puedes enviarlo nuevamente?",
-                )
-                return {"status": "audio_download_error"}
-
-            if transcription:
-                text = transcription
-                print("📝 Transcripción obtenida:", text)
-            else:
-                await send_text(
-                    from_id,
-                    "No pude transcribir tu audio. ¿Podrías intentarlo con otro mensaje?",
-                )
-                return {"status": "transcription_failed"}
+        elif msg_type in ("audio", "voice"):
+            media_id = msg[msg_type]["id"]
+            audio_bytes, mime = await download_media(media_id)
+            text = await transcribir_audio(audio_bytes, mime)
         else:
-            await send_text(
-                from_id,
-                "Por ahora solo puedo ayudarte con mensajes de texto o audios. 😊",
-            )
-            return {"status": "unsupported_type"}
+            await send_text(uid, "Solo acepto texto o audio 🙂")
+            return {"status": "unsupported"}
 
         if not text:
-            await send_text(
-                from_id,
-                "No recibí contenido para procesar. ¿Podrías enviarlo de nuevo?",
-            )
-            return {"status": "empty_text"}
+            await send_text(uid, "No pude leer tu mensaje.")
+            return {"status": "empty"}
 
-        # 1) ¿Es comando?
-        if text.strip().startswith("/"):
-            reply = handle_command(from_id, text)
-            await send_text(from_id, reply)
-            return {"status": "ok_command"}
+        # ========================
+        # COMANDOS
+        # ========================
+        if text.startswith("/"):
+            reply = handle_command(uid, text)
+            await send_text(uid, reply)
+            return {"status": "command"}
 
-        # 2) Obtener modo actual del usuario (por defecto: idiomas)
-        mode = user_sessions.get(from_id, MODO_IDIOMAS)
+        # ========================
+        # MODO
+        # ========================
+        mode = user_sessions.get(uid, MODO_IDIOMAS)
 
-        # 3) Enrutar según modo
         if mode == MODO_CHEF:
             print("🍳 Modo actual: CHEF")
-            # asumimos asistente_cheff(message: str) -> str (síncrono)
-            respuesta = asistente_cheff(message=text, client=client)
+            reply = await asistente_cheff(text)   # usa Responses API en funciones_openai.py
         else:
             print("🧠 Modo actual: IDIOMAS")
-            respuesta = await generar_respuesta_idiomas(text)
+            reply = await generar_respuesta_idiomas(text)
 
-        # 4) Responder por WhatsApp
-        await send_text(from_id, respuesta)
-
+        await send_text(uid, reply)
         return {"status": "ok"}
 
     except Exception as e:
-        print("❌ Error procesando webhook:", e)
-        return {"status": "error", "detail": str(e)}
+        print("❌ ERROR:", e)
+        return {"error": str(e)}
 
 # ====================================================
-# 5) ROOT
+# ROOT
 # ====================================================
 
 @app.get("/")
