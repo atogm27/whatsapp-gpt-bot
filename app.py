@@ -1,18 +1,21 @@
 import io
 import os
 import json
-from typing import cast  # 👈 CAMBIO
+from typing import cast
+
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 import httpx
 from openai import OpenAI
-from openai.types.chat import (         # 👈 CAMBIO
+from openai.types.chat import (
     ChatCompletionMessageToolCall,
     ChatCompletionToolParam,
 )
 
+from funciones_openai import asistente_cheff  # <- usamos tu bot chef
+
 # ====================================================
-# 0) CONSTANTES DE PROMPTS
+# 0) CONSTANTES DE PROMPTS (BOT DE IDIOMAS)
 # ====================================================
 
 PROMPT_CON_ERROR = """
@@ -27,19 +30,6 @@ Debes responder siempre en {language}.
 
 No seas excesivamente extenso. Sé amable, motivador y fomenta que el usuario siga practicando.
 Intenta que la conversación sea agradable y amena. Interésate por cualquier gusto que parezca tener.
-
-Ejemplo:
-
-It's great to hear that you're finding time for personal activities even after a busy day! 
-What kind of stuff are you working on for yourself? Is it a hobby or something else?
-
-Frase corregida: <Not too much here either. I've been working all day, and now I'm doing some stuff for myself.>
-
-En tu texto, el cambio principal es el uso de contracciones ("I'm" en lugar de "im")
-y la corrección de la frase para que suene más natural en inglés. 
-También es importante usar "myself" en lugar de "my own" para referirse a hacer cosas 
-para uno mismo. En inglés, es común usar la forma reflexiva "myself" después de verbos 
-como "doing".
 """
 
 PROMPT_SIN_ERROR = """
@@ -54,14 +44,14 @@ salvo que él lo pida explícitamente.
 
 Sé amable, motivador y fomenta que el usuario siga practicando.
 Intenta que la conversación sea agradable y amena.
-Interésate por cualquier gusto que parezca tener.
+Intéresate por cualquier gusto que parezca tener.
 """
 
 # ====================================================
 # 0.b) CONSTANTES DE TOOLS (FUNCTION CALLING)
 # ====================================================
 
-LANGUAGE_TOOL: ChatCompletionToolParam = {  # 👈 CAMBIO: tipo explícito
+LANGUAGE_TOOL: ChatCompletionToolParam = {
     "type": "function",
     "function": {
         "name": "clasificar_mensaje",
@@ -82,7 +72,7 @@ LANGUAGE_TOOL: ChatCompletionToolParam = {  # 👈 CAMBIO: tipo explícito
     },
 }
 
-ERRORS_TOOL: ChatCompletionToolParam = {  # 👈 CAMBIO: tipo explícito
+ERRORS_TOOL: ChatCompletionToolParam = {
     "type": "function",
     "function": {
         "name": "evaluar_errores",
@@ -112,12 +102,21 @@ ERRORS_TOOL: ChatCompletionToolParam = {  # 👈 CAMBIO: tipo explícito
 }
 
 # ====================================================
+# MODOS DE BOT Y SESIONES
+# ====================================================
+
+MODO_IDIOMAS = "idiomas"
+MODO_CHEF = "chef"
+
+# user_id (número de WhatsApp) -> modo actual
+user_sessions: dict[str, str] = {}
+
+# ====================================================
 # APP Y CONFIG
 # ====================================================
 
 app = FastAPI()
 
-# ====== VARIABLES DE ENTORNO ======
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 WA_PHONE_ID = os.environ.get("WA_PHONE_ID", "")
 WA_TOKEN = os.environ.get("WA_TOKEN", "")
@@ -139,10 +138,10 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 GRAPH_URL = f"https://graph.facebook.com/v20.0/{WA_PHONE_ID}/messages"
 
-
 # ====================================================
 # 1) VERIFICACIÓN DEL WEBHOOK (GET)
 # ====================================================
+
 @app.get("/webhook", response_class=PlainTextResponse)
 async def verify_webhook(request: Request):
     params = request.query_params
@@ -155,10 +154,10 @@ async def verify_webhook(request: Request):
 
     return PlainTextResponse("error: invalid token", status_code=403)
 
+# ====================================================
+# 2) ENVIAR MENSAJES A WHATSAPP
+# ====================================================
 
-# ====================================================
-# 2) FUNCIÓN PARA ENVIAR MENSAJES A WHATSAPP
-# ====================================================
 async def send_text(to: str, body: str):
     """Envía un mensaje de texto al usuario por WhatsApp Cloud API."""
     payload = {
@@ -178,13 +177,12 @@ async def send_text(to: str, body: str):
         print("📤 Respuesta de WhatsApp:", r.status_code, r.text)
         r.raise_for_status()
 
-
 # ====================================================
 # 2.b) DESCARGA DE MEDIOS (AUDIOS)
 # ====================================================
+
 async def download_media(media_id: str):
     """Descarga el binario del medio y su MIME type a partir de su media_id."""
-
     headers = {"Authorization": f"Bearer {WA_TOKEN}"}
     base_url = "https://graph.facebook.com/v20.0"
 
@@ -209,10 +207,10 @@ async def download_media(media_id: str):
 
         return media_resp.content, mime_type
 
-
 # ====================================================
 # 2.c) TRANSCRIPCIÓN DE AUDIOS
 # ====================================================
+
 def _extension_from_mime(mime_type: str) -> str:
     if not mime_type:
         return "mp3"
@@ -227,7 +225,6 @@ def _extension_from_mime(mime_type: str) -> str:
 
 async def transcribir_audio(audio_bytes: bytes, mime_type: str | None = None) -> str | None:
     """Envía el audio al endpoint de OpenAI y devuelve el texto transcrito."""
-
     ext = _extension_from_mime(mime_type or "")
     audio_file = io.BytesIO(audio_bytes)
     audio_file.name = f"audio.{ext}"
@@ -248,10 +245,10 @@ async def transcribir_audio(audio_bytes: bytes, mime_type: str | None = None) ->
     text = getattr(transcription, "text", "")
     return text.strip() if text else None
 
+# ====================================================
+# 3) DETECTAR IDIOMA (TOOL CALLING)
+# ====================================================
 
-# ====================================================
-# 3) FUNCIÓN PARA DETECTAR EL IDIOMA DEL MENSAJE
-# ====================================================
 async def detectar_idioma(text: str) -> str:
     res = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -270,12 +267,11 @@ async def detectar_idioma(text: str) -> str:
         tool_choice="auto",
     )
 
-    tool_calls = res.choices[0].message.tool_calls or []  # 👈 CAMBIO: or []
+    tool_calls = res.choices[0].message.tool_calls or []
     if not tool_calls:
         print("⚠️ No se devolvieron tool_calls al detectar idioma:", res)
         return "desconocido"
 
-    # 👇 CAMBIO: casteamos a ChatCompletionMessageToolCall para que el type checker sepa que tiene `.function`
     tool_call = cast(ChatCompletionMessageToolCall, tool_calls[0])
     args_json = tool_call.function.arguments
     args = json.loads(args_json)
@@ -283,10 +279,10 @@ async def detectar_idioma(text: str) -> str:
     language = args.get("language", "desconocido")
     return language
 
+# ====================================================
+# 3.b) EVALUAR SI HAY ERRORES (TOOL CALLING)
+# ====================================================
 
-# ====================================================
-# 3.b) FUNCIÓN PARA EVALUAR SI HAY ERRORES QUE CORREGIR
-# ====================================================
 async def evaluar_errores(text: str, language: str):
     """
     Devuelve:
@@ -314,12 +310,12 @@ async def evaluar_errores(text: str, language: str):
         temperature=0,
     )
 
-    tool_calls = res.choices[0].message.tool_calls or []  # 👈 CAMBIO
+    tool_calls = res.choices[0].message.tool_calls or []
     if not tool_calls:
         print("⚠️ No se devolvieron tool_calls al evaluar errores:", res)
         return False, "ninguno"
 
-    tool_call = cast(ChatCompletionMessageToolCall, tool_calls[0])  # 👈 CAMBIO
+    tool_call = cast(ChatCompletionMessageToolCall, tool_calls[0])
     args_json = tool_call.function.arguments
     args = json.loads(args_json)
 
@@ -328,10 +324,71 @@ async def evaluar_errores(text: str, language: str):
 
     return has_errors, severity
 
+# ====================================================
+# X) BOT DE IDIOMAS: GENERAR RESPUESTA
+# ====================================================
+
+async def generar_respuesta_idiomas(text: str) -> str:
+    # 1) Detectar idioma
+    language = await detectar_idioma(text)
+    print(f"🌍 Idioma detectado: {language}")
+
+    # 2) Evaluar errores
+    has_errors, severity = await evaluar_errores(text, language)
+    print(f"🧐 ¿Tiene errores?: {has_errors}, severidad: {severity}")
+
+    # 3) Elegir prompt
+    if has_errors:
+        system_prompt = PROMPT_CON_ERROR.format(language=language)
+    else:
+        system_prompt = PROMPT_SIN_ERROR.format(language=language)
+
+    # 4) Llamar a OpenAI
+    completion = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.5,
+    )
+
+    reply_raw = completion.choices[0].message.content
+    reply = reply_raw.strip() if reply_raw else "Lo siento, hubo un problema generando la respuesta."
+    return reply
+
+# ====================================================
+# X.b) MANEJO DE COMANDOS (/menu, /idiomas, /chef)
+# ====================================================
+
+def handle_command(from_id: str, text: str) -> str:
+    """
+    Devuelve el texto de respuesta al comando
+    y actualiza user_sessions[from_id] si hace falta.
+    """
+    cmd = text.strip().lower()
+
+    if cmd in ("/menu", "menu"):
+        return (
+            "🧠 *Menú de asistentes*\n"
+            "- /idiomas → Bot de idiomas (corrección + conversación)\n"
+            "- /chef → Asistente chef 🍳\n"
+        )
+
+    if cmd == "/idiomas":
+        user_sessions[from_id] = MODO_IDIOMAS
+        return "Has cambiado al modo 🧠 *Bot de idiomas*."
+
+    if cmd == "/chef":
+        user_sessions[from_id] = MODO_CHEF
+        return "Has cambiado al modo 🍳 *Asistente chef*."
+
+    return "Comando no reconocido. Escribe /menu para ver las opciones."
 
 # ====================================================
 # 4) WEBHOOK PRINCIPAL (POST)
 # ====================================================
+
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     data = await request.json()
@@ -398,45 +455,26 @@ async def receive_webhook(request: Request):
             )
             return {"status": "empty_text"}
 
-        # ====================================================
-        # 5) DETECTAR IDIOMA
-        # ====================================================
-        language = await detectar_idioma(text)
-        print(f"🌍 Idioma detectado: {language}")
+        # 1) ¿Es comando?
+        if text.strip().startswith("/"):
+            reply = handle_command(from_id, text)
+            await send_text(from_id, reply)
+            return {"status": "ok_command"}
 
-        # ====================================================
-        # 5.b) EVALUAR SI HAY ERRORES QUE MEREZCAN CORRECCIÓN
-        # ====================================================
-        has_errors, severity = await evaluar_errores(text, language)
-        print(f"🧐 ¿Tiene errores?: {has_errors}, severidad: {severity}")
+        # 2) Obtener modo actual del usuario (por defecto: idiomas)
+        mode = user_sessions.get(from_id, MODO_IDIOMAS)
 
-        # ====================================================
-        # 6) ELEGIR PROMPT EN FUNCIÓN DE SI HAY ERRORES
-        # ====================================================
-        if has_errors:
-            system_prompt = PROMPT_CON_ERROR.format(language=language)
+        # 3) Enrutar según modo
+        if mode == MODO_CHEF:
+            print("🍳 Modo actual: CHEF")
+            # asumimos asistente_cheff(message: str) -> str (síncrono)
+            respuesta = asistente_cheff(message=text, client=client)
         else:
-            system_prompt = PROMPT_SIN_ERROR.format(language=language)
+            print("🧠 Modo actual: IDIOMAS")
+            respuesta = await generar_respuesta_idiomas(text)
 
-        # ====================================================
-        # 7) LLAMADA PRINCIPAL A OPENAI PARA GENERAR RESPUESTA
-        # ====================================================
-        completion = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.5,
-        )
-
-        reply_raw = completion.choices[0].message.content
-        reply = reply_raw.strip() if reply_raw else "Lo siento, hubo un problema generando la respuesta."
-
-        # ====================================================
-        # 8) RESPONDER AL USUARIO POR WHATSAPP
-        # ====================================================
-        await send_text(from_id, reply)
+        # 4) Responder por WhatsApp
+        await send_text(from_id, respuesta)
 
         return {"status": "ok"}
 
@@ -444,6 +482,9 @@ async def receive_webhook(request: Request):
         print("❌ Error procesando webhook:", e)
         return {"status": "error", "detail": str(e)}
 
+# ====================================================
+# 5) ROOT
+# ====================================================
 
 @app.get("/")
 async def root():
